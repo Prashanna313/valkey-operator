@@ -19,6 +19,7 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 
 	valkeyiov1alpha1 "github.com/valkey-io/valkey-operator/api/v1alpha1"
@@ -298,11 +299,10 @@ func buildContainersDef(node *valkeyiov1alpha1.ValkeyNode) ([]corev1.Container, 
 				},
 			},
 			LivenessProbe: &corev1.Probe{
-				InitialDelaySeconds: 5,
-				PeriodSeconds:       5,
-				FailureThreshold:    5,
-				TimeoutSeconds:      5,
-				SuccessThreshold:    1,
+				PeriodSeconds:    5,
+				FailureThreshold: 5,
+				TimeoutSeconds:   5,
+				SuccessThreshold: 1,
 				ProbeHandler: corev1.ProbeHandler{
 					Exec: &corev1.ExecAction{
 						Command: []string{
@@ -314,11 +314,10 @@ func buildContainersDef(node *valkeyiov1alpha1.ValkeyNode) ([]corev1.Container, 
 				},
 			},
 			ReadinessProbe: &corev1.Probe{
-				InitialDelaySeconds: 5,
-				PeriodSeconds:       5,
-				FailureThreshold:    5,
-				TimeoutSeconds:      2,
-				SuccessThreshold:    1,
+				PeriodSeconds:    5,
+				FailureThreshold: 5,
+				TimeoutSeconds:   2,
+				SuccessThreshold: 1,
 				ProbeHandler: corev1.ProbeHandler{
 					Exec: &corev1.ExecAction{
 						Command: []string{
@@ -612,10 +611,31 @@ func buildValkeyNodePodTemplateSpec(node *valkeyiov1alpha1.ValkeyNode, labels ma
 
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels: labels,
+			Labels: podTemplateLabels(node, labels),
 		},
 		Spec: podSpec,
 	}, nil
+}
+
+// podTemplateLabels returns a new map so the workload selector never picks up
+// user labels: the selector is immutable after creation.
+func podTemplateLabels(node *valkeyiov1alpha1.ValkeyNode, selectorLabels map[string]string) map[string]string {
+	var user map[string]valkeyiov1alpha1.LabelValue
+	if node.Spec.PodMetadata != nil {
+		user = node.Spec.PodMetadata.Labels
+	}
+	return withUserMetadata(user, selectorLabels)
+}
+
+// withUserMetadata returns user entries overlaid by the operator's, so an
+// operator key always wins.
+func withUserMetadata[V ~string](user map[string]V, operator map[string]string) map[string]string {
+	out := make(map[string]string, len(user)+len(operator))
+	for k, v := range user {
+		out[k] = string(v)
+	}
+	maps.Copy(out, operator)
+	return out
 }
 
 // buildValkeyNodeDeployment constructs a single-replica Deployment for a
