@@ -17,11 +17,12 @@ limitations under the License.
 package controller
 
 import (
+	"cmp"
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -63,19 +64,22 @@ type ValkeyClusterReconciler struct {
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
 	Recorder  events.EventRecorder
+	// ValkeyClients hands out pooled Valkey clients. SetupWithManager
+	// requires it.
+	ValkeyClients ClientProvider
 
 	// clusterStateFunc stands in for the scrape of the live cluster. It is
 	// nil in production; tests set it, since envtest has no Valkey to dial.
-	clusterStateFunc func(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, nodes *valkeyiov1alpha1.ValkeyNodeList, username, password string) *valkey.ClusterState
+	clusterStateFunc func(ctx context.Context, nodes *valkeyiov1alpha1.ValkeyNodeList) *valkey.ClusterState
 }
 
 // scrapeClusterState returns the live cluster state, from the test hook when
 // one is set and from the nodes otherwise.
-func (r *ValkeyClusterReconciler) scrapeClusterState(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, nodes *valkeyiov1alpha1.ValkeyNodeList, username, password string) *valkey.ClusterState {
+func (r *ValkeyClusterReconciler) scrapeClusterState(ctx context.Context, nodes *valkeyiov1alpha1.ValkeyNodeList, dial valkey.DialFunc) *valkey.ClusterState {
 	if r.clusterStateFunc != nil {
-		return r.clusterStateFunc(ctx, cluster, nodes, username, password)
+		return r.clusterStateFunc(ctx, nodes)
 	}
-	return r.getValkeyClusterState(ctx, cluster, nodes, username, password)
+	return valkey.GetClusterState(ctx, nodeAddresses(nodes), DefaultPort, dial)
 }
 
 // +kubebuilder:rbac:groups=valkey.io,resources=valkeyclusters,verbs=get;list;watch;create;update;patch;delete
@@ -125,7 +129,7 @@ func (r *ValkeyClusterReconciler) scrapeClusterState(ctx context.Context, cluste
 //     for periodic health checks.
 //
 // For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
+// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.25.0/pkg/reconcile
 func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) { //nolint:gocyclo
 	log := logf.FromContext(ctx)
 	log.V(1).Info("reconcile...")
@@ -211,15 +215,14 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// One cluster-state snapshot per reconcile, shared throughout reconcile
-	operatorPassword, err := fetchSystemUserPassword(ctx, operatorUser, r.Client, cluster.Name, cluster.Namespace)
+	dial, err := r.ValkeyClients.ForCluster(ctx, cluster)
 	if err != nil {
 		log.Error(err, "failed to retrieve system user password")
 		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonSystemUsersAclError, err.Error(), metav1.ConditionFalse)
 		_ = r.updateStatus(ctx, cluster, nil)
 		return ctrl.Result{}, err
 	}
-	state := r.scrapeClusterState(ctx, cluster, nodes, operatorUser, operatorPassword)
-	defer state.CloseClients()
+	state := r.scrapeClusterState(ctx, nodes, dial)
 
 	rollSkipped := false
 	// A held roll requeues like any roll in progress; only the message says
@@ -241,16 +244,16 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonUpdatingNodes, "Updating ValkeyNodes", metav1.ConditionTrue)
 	} else if err != nil {
 		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonValkeyNodeError, err.Error(), metav1.ConditionFalse)
-		_ = r.updateStatus(ctx, cluster, nil)
+		_ = r.updateStatus(ctx, cluster, state)
 		return ctrl.Result{}, err
 	} else if requeue {
 		// An unschedulable pod is reported first, whether the roll is under
 		// way or held. The pod it reports belongs to a later shard or sits
 		// outside the shard loop: a shard's own replica that is not Ready
 		// requeues before the walk reaches its primary.
-		if result, handled, err := r.handlePodSchedulingIssues(ctx, cluster); err != nil {
+		if result, handled, err := r.handlePodSchedulingIssues(ctx, cluster, state); err != nil {
 			setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonValkeyNodeError, err.Error(), metav1.ConditionFalse)
-			_ = r.updateStatus(ctx, cluster, nil)
+			_ = r.updateStatus(ctx, cluster, state)
 			return ctrl.Result{}, err
 		} else if handled {
 			return result, nil
@@ -261,7 +264,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonUpdatingNodes, msg, metav1.ConditionFalse)
 		setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonUpdatingNodes, msg, metav1.ConditionTrue)
-		_ = r.updateStatus(ctx, cluster, nil)
+		_ = r.updateStatus(ctx, cluster, state)
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
@@ -371,7 +374,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return result, nil
 	}
 
-	if result, handled, err := r.handlePodSchedulingIssues(ctx, cluster); err != nil {
+	if result, handled, err := r.handlePodSchedulingIssues(ctx, cluster, state); err != nil {
 		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonValkeyNodeError, err.Error(), metav1.ConditionFalse)
 		_ = r.updateStatus(ctx, cluster, state)
 		return ctrl.Result{}, err
@@ -439,7 +442,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// time using CLUSTER MIGRATESLOTS (atomic migration, requires
 	// Valkey >= 9.0). Each pass requeues so the next reconcile
 	// re-evaluates cluster state with fresh topology before continuing.
-	rebalanced, err := r.rebalanceSlots(ctx, cluster, allShards)
+	move, err := r.rebalanceSlots(ctx, cluster, allShards)
 	if err != nil {
 		log.Error(err, "slot rebalancing failed")
 		r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "SlotRebalanceFailed", "RebalanceSlots", "Slot rebalancing failed: %v", err)
@@ -449,13 +452,19 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		_ = r.updateStatus(ctx, cluster, state)
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
-	if rebalanced {
+	if move != nil {
 		// Clear any stale Degraded condition from earlier phases (e.g.
 		// NodeAddFailed set when replicas couldn't attach to primaries
 		// that hadn't received slots yet during scale-out).
 		meta.RemoveStatusCondition(&cluster.Status.Conditions, valkeyiov1alpha1.ConditionDegraded)
-		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Cluster is Reconciling", metav1.ConditionFalse)
-		setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonRebalancingSlots, "Rebalancing slots across primaries", metav1.ConditionTrue)
+		// Name the shard receiving this batch. With more than one shard
+		// under its share, the name changes as each one fills.
+		msg := "Rebalancing slots across primaries"
+		if _, dstShard := nodeRoleAndShard(move.Dst.Address, nodes); dstShard >= 0 {
+			msg = fmt.Sprintf("Rebalancing slots onto shard %d", dstShard)
+		}
+		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, msg, metav1.ConditionFalse)
+		setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonRebalancingSlots, msg, metav1.ConditionTrue)
 		_ = r.updateStatus(ctx, cluster, state)
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
@@ -502,7 +511,7 @@ type podSchedulingIssue struct {
 	message string
 }
 
-func (r *ValkeyClusterReconciler) handlePodSchedulingIssues(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster) (ctrl.Result, bool, error) {
+func (r *ValkeyClusterReconciler) handlePodSchedulingIssues(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, state *valkey.ClusterState) (ctrl.Result, bool, error) {
 	issue, err := r.findPodSchedulingIssue(ctx, cluster)
 	if err != nil {
 		return ctrl.Result{}, false, err
@@ -521,7 +530,7 @@ func (r *ValkeyClusterReconciler) handlePodSchedulingIssues(ctx context.Context,
 	setCondition(cluster, valkeyiov1alpha1.ConditionDegraded, valkeyiov1alpha1.ReasonPodUnschedulable, message, metav1.ConditionTrue)
 	setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonPodUnschedulable, message, metav1.ConditionFalse)
 	setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonReconciling, "Waiting for unschedulable pods to be scheduled", metav1.ConditionTrue)
-	if err := r.updateStatus(ctx, cluster, nil); err != nil {
+	if err := r.updateStatus(ctx, cluster, state); err != nil {
 		return ctrl.Result{}, false, err
 	}
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, true, nil
@@ -1047,7 +1056,7 @@ func buildClusterValkeyNode(cluster *valkeyiov1alpha1.ValkeyCluster, shardIndex 
 	}
 
 	// Hostname announce only when discovery selects Hostname. ClusterDomain is
-	// always written so node TLS ServerName matches getValkeyClusterState.
+	// always written so node TLS ServerName matches the one ForCluster dials with.
 	var preferredEndpoint valkeyiov1alpha1.PreferredEndpointType
 	if cluster.PrefersHostnameAnnounce() {
 		preferredEndpoint = valkeyiov1alpha1.PreferredEndpointTypeHostname
@@ -1079,15 +1088,12 @@ func buildClusterValkeyNode(cluster *valkeyiov1alpha1.ValkeyCluster, shardIndex 
 			Config:                        cluster.Spec.Config,
 			PodSecurityContext:            cluster.Spec.PodSecurityContext,
 			ServiceAccountName:            cluster.Spec.ServiceAccountName,
+			PodMetadata:                   cluster.Spec.PodMetadata,
 			TerminationGracePeriodSeconds: gracePeriod,
 			PreferredEndpointType:         preferredEndpoint,
 			ClusterDomain:                 clusterDomain,
 		},
 	}
-}
-
-func (r *ValkeyClusterReconciler) getValkeyClusterState(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, nodes *valkeyiov1alpha1.ValkeyNodeList, username, password string) *valkey.ClusterState {
-	return scrapeClusterState(ctx, r.APIReader, cluster, nodeAddresses(nodes), username, password)
 }
 
 // nodeAddresses returns the pod IPs of every node that has one. Nodes still
@@ -1101,22 +1107,6 @@ func nodeAddresses(nodes *valkeyiov1alpha1.ValkeyNodeList) []string {
 		ips = append(ips, node.Status.PodIP)
 	}
 	return ips
-}
-
-// scrapeClusterState connects to the given addresses and builds a live topology
-// snapshot.
-func scrapeClusterState(ctx context.Context, apiReader client.Reader, cluster *valkeyiov1alpha1.ValkeyCluster, addresses []string, username, password string) *valkey.ClusterState {
-	var tlsConfig *tls.Config
-	if tlsSpec := nodeTLSFromCluster(cluster); tlsSpec != nil && tlsSpec.Certificates.Server.SecretName != "" {
-		cfg, err := getTLSConfig(ctx, apiReader, tlsSpec.Certificates.Server.SecretName, tlsSpec.ServerName, cluster.Namespace, tlsSpec.RequiresClientCertificate())
-		if err != nil {
-			logf.FromContext(ctx).Error(err, "failed to build TLS config for cluster state, falling back to plaintext",
-				"secretName", tlsSpec.Certificates.Server.SecretName)
-		} else {
-			tlsConfig = cfg
-		}
-	}
-	return valkey.GetClusterState(ctx, addresses, DefaultPort, username, password, tlsConfig)
 }
 
 // healStaleAddressPeers re-introduces live cluster members to nodes whose
@@ -1473,57 +1463,105 @@ func (r *ValkeyClusterReconciler) replicateToShardPrimary(ctx context.Context, c
 	return nil
 }
 
-// promoteOrphanedReplicas issues CLUSTER FAILOVER TAKEOVER to replicas whose
-// primary is dead and failover quorum is unreachable. With persistence enabled
-// the pod will return with the same node ID, so TAKEOVER is skipped.
-// Returns (result, true) if a promotion was made and reconcile should requeue.
+// promoteOrphanedReplicas recovers shards whose primary is dead. It prefers
+// Valkey's own coordinated failover, which is epoch-safe and cannot fragment
+// slots, and forces a CLUSTER FAILOVER TAKEOVER only when native failover
+// cannot proceed. orphansToTakeOver decides which shards those are.
+//
+// The candidates are tried in order until one TAKEOVER succeeds, so a replica
+// that keeps rejecting it does not hold back the other shards.
+//
+// With persistence enabled the pod returns with the same node ID, so recovery
+// is left entirely to Valkey.
+// Returns (result, true) if it acted and reconcile should requeue.
 func (r *ValkeyClusterReconciler) promoteOrphanedReplicas(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, state *valkey.ClusterState) (ctrl.Result, bool) {
-	if cluster.Spec.Persistence != nil || state.HasFailoverQuorum() {
+	if cluster.Spec.Persistence != nil {
 		return ctrl.Result{}, false
 	}
 	log := logf.FromContext(ctx)
-	var promoted, attempted int
-	deadPrimaries := make(map[string]bool)
+	candidates := orphansToTakeOver(state)
+	if len(candidates) == 0 {
+		return ctrl.Result{}, false
+	}
+	for _, c := range candidates {
+		log.Info("promoting orphaned replica via TAKEOVER", "node", c.replica.Address, "deadPrimary", c.primaryId)
+		if err := c.replica.Client.Do(ctx, c.replica.Client.B().ClusterFailover().Takeover().Build()).Error(); err != nil {
+			log.Error(err, "CLUSTER FAILOVER TAKEOVER failed", "node", c.replica.Address)
+			continue
+		}
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "ReplicasTakenOver", "FailoverTakeover", "Promoted orphaned replica via TAKEOVER for dead primary %s", c.primaryId)
+		break // one takeover per reconcile; requeue and re-evaluate
+	}
+	return ctrl.Result{RequeueAfter: 2 * time.Second}, true
+}
+
+// orphan is an orphaned replica and the ID of its dead primary.
+type orphan struct {
+	replica   *valkey.NodeState
+	primaryId string
+}
+
+// orphansToTakeOver returns, in a stable order, the orphaned replicas to
+// promote with TAKEOVER: for each qualifying dead primary, its most caught-up
+// replica. It returns none when native failover can or will recover every
+// dead primary.
+//
+// Native failover needs a majority of primaries to vote:
+//   - Without quorum (a majority of primaries dead at once), no election can
+//     complete, so every dead primary with a replica qualifies. One promotion
+//     restores a voting primary; the remaining shards then recover natively,
+//     or are taken over on a later reconcile if quorum is still short.
+//   - With quorum, Valkey elects a replacement on its own, unless the replica
+//     reports the nofailover flag. Such a primary qualifies once its failure
+//     is confirmed (fail, or fail? from a majority of the slot-owning
+//     primaries).
+//
+// A primary the operator itself reached in this scrape never qualifies: it
+// is alive, so a peer's failure flag for it is stale or one-sided, and a
+// takeover would force a needless failover that loses its unreplicated writes.
+// Nor does a dead primary whose shard already has a live primary owning slots:
+// a second takeover there would only move the slots again.
+//
+// Without persistence, a primary that is only partitioned can still be taken
+// over: the replica claims its slots at a higher epoch, and the old primary
+// demotes itself on reconnect, losing writes it accepted meanwhile.
+func orphansToTakeOver(state *valkey.ClusterState) []orphan {
+	var deadPrimaries []string
 	for _, shard := range state.Shards {
+		if shard.GetPrimaryNode() != nil && len(shard.Slots) > 0 {
+			// Already served, for example by a replica promoted on an earlier
+			// reconcile while its sibling replicas still name the old primary.
+			continue
+		}
 		for _, node := range shard.Nodes {
 			primaryId := node.PrimaryIdFromSelf()
 			if primaryId == "-" || primaryId == "" {
 				continue // node is a primary
 			}
-			if deadPrimaries[primaryId] {
-				continue
+			if slices.Contains(deadPrimaries, primaryId) || !state.IsNodeFailed(primaryId) {
+				continue // no viewer reports 'fail' (or 'fail?')
 			}
-			if !state.IsNodeFailed(primaryId) {
-				continue
+			if state.FindNodeById(primaryId) != nil {
+				continue // the operator reaches it, so it is not dead
 			}
-			// Note: we don't check if the pod still exists in k8s here.
-			// Without persistence, even if the primary is merely partitioned
-			// (not gone), the TAKEOVER'd replica will own the slots at a
-			// higher epoch. A returning primary will see the higher epoch
-			// and demote itself; no split-brain.
-			deadPrimaries[primaryId] = true
+			deadPrimaries = append(deadPrimaries, primaryId)
 		}
 	}
-	for primaryId := range deadPrimaries {
+	slices.Sort(deadPrimaries)
+
+	quorum := state.HasFailoverQuorum()
+	var orphans []orphan
+	for _, primaryId := range deadPrimaries {
 		replica := state.BestReplicaOf(primaryId)
 		if replica == nil {
 			continue
 		}
-		attempted++
-		log.Info("promoting orphaned replica via TAKEOVER", "node", replica.Address, "deadPrimary", primaryId)
-		if err := replica.Client.Do(ctx, replica.Client.B().ClusterFailover().Takeover().Build()).Error(); err != nil {
-			log.Error(err, "CLUSTER FAILOVER TAKEOVER failed", "node", replica.Address)
-		} else {
-			promoted++
+		noFailover := replica.Myself().IsAutomaticFailoverDisabled()
+		if !quorum || (noFailover && state.IsNodeFailedByMajority(primaryId)) {
+			orphans = append(orphans, orphan{replica: replica, primaryId: primaryId})
 		}
 	}
-	if promoted > 0 || attempted > 0 {
-		if promoted > 0 {
-			r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "ReplicasTakenOver", "FailoverTakeover", "Promoted %d orphaned replica(s) via TAKEOVER", promoted)
-		}
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, true
-	}
-	return ctrl.Result{}, false
+	return orphans
 }
 
 // Check each cluster node and forget stale nodes (noaddr or status fail)
@@ -1587,7 +1625,7 @@ func (r *ValkeyClusterReconciler) updateStatus(ctx context.Context, cluster *val
 	patchBase := current.DeepCopy()
 	patch := client.MergeFrom(patchBase)
 
-	// Update shard counts
+	// Update shard counts. A nil state leaves the stored counts in place.
 	if state != nil {
 		current.Status.ReadyShards = r.countReadyShards(state, cluster)
 		current.Status.Shards = int32(len(state.Shards))
@@ -1645,7 +1683,9 @@ func (r *ValkeyClusterReconciler) countReadyShards(state *valkey.ClusterState, c
 	var readyCount int32 = 0
 	requiredNodes := 1 + int(cluster.Spec.Replicas)
 	for _, shard := range state.Shards {
-		if len(shard.Nodes) < requiredNodes || shard.GetPrimaryNode() == nil {
+		// A shard whose primary owns no slots, drained or not yet filled,
+		// serves nothing.
+		if len(shard.Nodes) < requiredNodes || shard.GetPrimaryNode() == nil || len(shard.Slots) == 0 {
 			continue
 		}
 		// Check if all nodes in this shard are healthy and in sync. Health is
@@ -1673,29 +1713,29 @@ func (r *ValkeyClusterReconciler) countReadyShards(state *valkey.ClusterState, c
 
 const rebalanceSlotBatchSize = 400
 
-func (r *ValkeyClusterReconciler) rebalanceSlots(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, shards []*valkey.ShardState) (bool, error) {
+// rebalanceSlots plans one slot move and starts it. It returns the move while
+// the rebalance has work left, whether this pass migrated a batch or waited
+// for one in flight, and nil once the slots are balanced.
+func (r *ValkeyClusterReconciler) rebalanceSlots(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, shards []*valkey.ShardState) (*valkey.SlotMove, error) {
 	move, err := valkey.PlanRebalanceMove(shards, int(cluster.Spec.Shards), rebalanceSlotBatchSize)
-	if err != nil {
-		return false, err
-	}
-	if move == nil {
-		return false, nil
+	if err != nil || move == nil {
+		return nil, err
 	}
 
 	log := logf.FromContext(ctx)
 	inProgress, err := valkey.SlotMigrationInProgress(ctx, move.Src)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if inProgress {
 		log.V(1).Info("slot migration already in progress", "src", move.Src.Address)
-		return true, nil
+		return move, nil
 	}
 
 	if !move.Src.KnowsNode(move.Dst.Id) {
 		log.V(1).Info("destination not yet visible to source via gossip; will retry", "src", move.Src.Address, "dst", move.Dst.Address, "dstId", move.Dst.Id)
 		r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "SlotsRebalancePending", "RebalanceSlots", "Waiting for %s to learn node %s", move.Src.Address, move.Dst.Address)
-		return true, nil
+		return move, nil
 	}
 
 	log.V(1).Info("rebalancing slots", "src", move.Src.Address, "dst", move.Dst.Address, "slots", len(move.Slots))
@@ -1705,21 +1745,23 @@ func (r *ValkeyClusterReconciler) rebalanceSlots(ctx context.Context, cluster *v
 	if err := valkey.MigrateSlotsAtomic(ctx, move.Src, move.Dst, ranges); err != nil {
 		if valkey.IsSlotsNotServedByNode(err) {
 			log.V(1).Info("slots no longer served by source; will retry with fresh state", "src", move.Src.Address, "dst", move.Dst.Address)
-			return true, nil
+			return move, nil
 		}
-		return false, err
+		return nil, err
 	}
 	slotMigrationBatchesTotal.WithLabelValues(cluster.Name, cluster.Namespace).Inc()
-	return true, nil
+	return move, nil
 }
 
 // effectiveShards returns state.Shards plus any pending primaries that are
-// scale-out leaders (slot-less Valkey primaries labeled as RolePrimary).
+// scale-out leaders (slot-less Valkey primaries labeled as RolePrimary). A
+// pending node-index 0 pod whose shard is already in the topology replaces a
+// failed primary and waits to become its replica, so it is left out.
 func effectiveShards(state *valkey.ClusterState, nodes *valkeyiov1alpha1.ValkeyNodeList) []*valkey.ShardState {
 	shards := append([]*valkey.ShardState(nil), state.Shards...)
 	for _, node := range state.PendingNodes {
-		role, _ := nodeRoleAndShard(node.Address, nodes)
-		if role == RolePrimary {
+		role, shardIndex := nodeRoleAndShard(node.Address, nodes)
+		if role == RolePrimary && !shardExistsInTopology(state, shardIndex, nodes) {
 			shards = append(shards, &valkey.ShardState{
 				Id:        node.ShardId,
 				Nodes:     []*valkey.NodeState{node},
@@ -1731,140 +1773,144 @@ func effectiveShards(state *valkey.ClusterState, nodes *valkeyiov1alpha1.ValkeyN
 }
 
 // handleScaleIn drains excess shards and cleans up leftover ValkeyNodes.
-// Returns (result, true) when work was done or an error occurred and the
-// caller should requeue instead of continuing to health checks.
+// Returns (result, true) when work was done, scale-in is blocked, or an error
+// occurred, and the caller should requeue instead of continuing to health
+// checks.
 func (r *ValkeyClusterReconciler) handleScaleIn(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, state *valkey.ClusterState, nodes *valkeyiov1alpha1.ValkeyNodeList) (ctrl.Result, bool) {
 	log := logf.FromContext(ctx)
 
-	if len(state.Shards) > int(cluster.Spec.Shards) {
-		drained, err := r.drainExcessShards(ctx, cluster, state, nodes)
-		if err != nil {
-			log.Error(err, "scale-in draining failed")
-			r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "DrainFailed", "ScaleIn", "Failed to drain excess shards: %v", err)
-			setCondition(cluster, valkeyiov1alpha1.ConditionDegraded, valkeyiov1alpha1.ReasonRebalanceFailed, err.Error(), metav1.ConditionTrue)
-			setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Scaling in cluster", metav1.ConditionFalse)
-			setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonRebalancingSlots, "Rebalancing slots for scale-in", metav1.ConditionTrue)
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, true
-		}
-		if drained {
-			meta.RemoveStatusCondition(&cluster.Status.Conditions, valkeyiov1alpha1.ConditionDegraded)
-			setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Scaling in cluster", metav1.ConditionFalse)
-			setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonRebalancingSlots, "Rebalancing slots for scale-in", metav1.ConditionTrue)
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, true
-		}
+	drained, err := r.drainExcessShards(ctx, cluster, state, nodes)
+	switch {
+	case errors.Is(err, errNoDrainDestination):
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "ScaleInBlocked", "ScaleIn", "Scale-in blocked: %v", err)
+		setScaleInBlocked(cluster, err.Error())
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, true
+	case err != nil:
+		log.Error(err, "scale-in draining failed")
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "DrainFailed", "ScaleIn", "Failed to drain excess shards: %v", err)
+		setCondition(cluster, valkeyiov1alpha1.ConditionDegraded, valkeyiov1alpha1.ReasonRebalanceFailed, err.Error(), metav1.ConditionTrue)
+		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Scaling in cluster", metav1.ConditionFalse)
+		setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonRebalancingSlots, "Rebalancing slots for scale-in", metav1.ConditionTrue)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, true
+	case drained:
+		meta.RemoveStatusCondition(&cluster.Status.Conditions, valkeyiov1alpha1.ConditionDegraded)
+		setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonReconciling, "Scaling in cluster", metav1.ConditionFalse)
+		setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonRebalancingSlots, "Rebalancing slots for scale-in", metav1.ConditionTrue)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, true
 	}
 
-	// Clean up leftover ValkeyNodes from a previous scale-in where drained
-	// primaries became replicas before their ValkeyNodes could be deleted.
-	if deleted, err := r.deleteExcessValkeyNodes(ctx, cluster); err != nil {
+	// Delete the ValkeyNodes of drained shards, and leftovers from a previous
+	// scale-in where drained primaries became replicas before their
+	// ValkeyNodes could be deleted.
+	deleted, kept, err := r.deleteExcessValkeyNodes(ctx, cluster, state, nodes)
+	if err != nil {
 		log.Error(err, "failed to delete excess ValkeyNodes")
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, true
-	} else if deleted {
+	}
+	if len(kept) > 0 {
+		setScaleInBlocked(cluster, fmt.Sprintf("Keeping excess ValkeyNode(s) %s until their slots are accounted for", strings.Join(kept, ", ")))
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, true
+	}
+	if deleted {
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, true
 	}
-
 	return ctrl.Result{}, false
 }
 
-// drainExcessShards handles scale-in by migrating slots away from shards
-// whose pod shard-index >= spec.Shards. Once a shard is fully drained (0
-// slots), its ValkeyNodes are deleted; forgetStaleNodes on the next reconcile
-// cleans up the Valkey topology.
-// Returns true if any work was done (caller should requeue).
-func (r *ValkeyClusterReconciler) drainExcessShards(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, state *valkey.ClusterState, nodes *valkeyiov1alpha1.ValkeyNodeList) (bool, error) {
-	log := logf.FromContext(ctx)
-	expectedShards := int(cluster.Spec.Shards)
+// setScaleInBlocked marks the cluster as not Ready while scale-in waits on
+// something it cannot fix by itself.
+func setScaleInBlocked(cluster *valkeyiov1alpha1.ValkeyCluster, msg string) {
+	setCondition(cluster, valkeyiov1alpha1.ConditionReady, valkeyiov1alpha1.ReasonScaleInBlocked, msg, metav1.ConditionFalse)
+	setCondition(cluster, valkeyiov1alpha1.ConditionProgressing, valkeyiov1alpha1.ReasonScaleInBlocked, msg, metav1.ConditionTrue)
+}
 
-	var remaining, draining []*valkey.ShardState
-	for _, shard := range state.Shards {
-		shardIndex := shardIndexFromState(shard, nodes)
-		if shardIndex >= 0 && shardIndex < expectedShards {
-			remaining = append(remaining, shard)
-		} else {
-			draining = append(draining, shard)
-		}
-	}
-	if len(draining) == 0 {
-		return false, nil
-	}
-
-	for _, shard := range draining {
-		move, err := valkey.PlanDrainMove(shard, remaining, rebalanceSlotBatchSize)
-		if err != nil {
-			return false, err
-		}
-		if move == nil {
-			continue
-		}
-
-		inProgress, err := valkey.SlotMigrationInProgress(ctx, move.Src)
-		if err != nil {
-			return false, err
-		}
-		if inProgress {
-			log.V(1).Info("drain migration in progress", "src", move.Src.Address)
-			return true, nil
-		}
-
-		if !move.Src.KnowsNode(move.Dst.Id) {
-			log.V(1).Info("drain destination not yet known to source", "src", move.Src.Address, "dst", move.Dst.Address)
-			return true, nil
-		}
-
-		log.V(1).Info("draining slots", "src", move.Src.Address, "dst", move.Dst.Address, "slots", len(move.Slots))
-		r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "SlotsDraining", "ScaleIn", "Moving %d slots from %s to %s", len(move.Slots), move.Src.Address, move.Dst.Address)
-
-		ranges := valkey.SlotsToRanges(move.Slots)
-		if err := valkey.MigrateSlotsAtomic(ctx, move.Src, move.Dst, ranges); err != nil {
-			if valkey.IsSlotsNotServedByNode(err) {
-				return true, nil
-			}
-			return false, err
-		}
-		slotMigrationBatchesTotal.WithLabelValues(cluster.Name, cluster.Namespace).Inc()
-		return true, nil
-	}
-
-	// All draining shards have 0 slots — delete their ValkeyNodes.
-	for _, shard := range draining {
+// splitShardsForScaleIn returns the in-spec shards, emptiest first, and the
+// excess shards that still own slots. Shards whose index is unknown are in
+// neither list. PlanDrainMove sends slots to the first destination, so putting
+// the emptiest first keeps them from being moved twice by the rebalance.
+func splitShardsForScaleIn(shards []*valkey.ShardState, nodes *valkeyiov1alpha1.ValkeyNodeList, expectedShards int) (remaining, draining []*valkey.ShardState) {
+	for _, shard := range shards {
 		shardIndex := shardIndexFromState(shard, nodes)
 		if shardIndex < 0 {
 			continue
 		}
-		nodesPerShard := 1 + int(cluster.Spec.Replicas)
-		for nodeIndex := range nodesPerShard {
-			name := valkeyNodeName(cluster.Name, shardIndex, nodeIndex)
-			node := &valkeyiov1alpha1.ValkeyNode{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      name,
-					Namespace: cluster.Namespace,
-				},
-			}
-			if err := r.Delete(ctx, node); err != nil {
-				if !apierrors.IsNotFound(err) {
-					return false, fmt.Errorf("delete ValkeyNode %s: %w", name, err)
-				}
-			} else {
-				log.V(1).Info("deleted ValkeyNode for drained shard", "name", name, "shard", shardIndex)
-				r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "ValkeyNodeDeleted", "ScaleIn", "Deleted ValkeyNode %s (shard %d)", name, shardIndex)
-			}
+		if shardIndex < expectedShards {
+			remaining = append(remaining, shard)
+		} else if len(shard.Slots) > 0 {
+			draining = append(draining, shard)
 		}
 	}
+	slices.SortStableFunc(remaining, func(a, b *valkey.ShardState) int {
+		return cmp.Compare(countSlots(a.Slots), countSlots(b.Slots))
+	})
+	return remaining, draining
+}
+
+var errNoDrainDestination = errors.New("there is no in-spec primary to drain into")
+
+// drainExcessShards handles scale-in by migrating slots away from shards
+// whose pod shard-index >= spec.Shards, one batch per call. Their ValkeyNodes
+// are deleted by deleteExcessValkeyNodes once they own no slots, and
+// forgetStaleNodes then cleans up the Valkey topology.
+// Returns true while a move is pending or in flight (caller should requeue).
+func (r *ValkeyClusterReconciler) drainExcessShards(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, state *valkey.ClusterState, nodes *valkeyiov1alpha1.ValkeyNodeList) (bool, error) {
+	log := logf.FromContext(ctx)
+	expectedShards := int(cluster.Spec.Shards)
+
+	// effectiveShards, not state.Shards: when a scale-out is cut short, the
+	// new slot-less primaries may be the only in-spec shards left to drain into.
+	remaining, draining := splitShardsForScaleIn(effectiveShards(state, nodes), nodes, expectedShards)
+	if len(draining) == 0 {
+		return false, nil
+	}
+	if len(remaining) == 0 {
+		return false, fmt.Errorf("shard %s owns slots but %w", draining[0].Id, errNoDrainDestination)
+	}
+
+	move, err := valkey.PlanDrainMove(draining[0], remaining, rebalanceSlotBatchSize)
+	if err != nil {
+		return false, err
+	}
+
+	inProgress, err := valkey.SlotMigrationInProgress(ctx, move.Src)
+	if err != nil {
+		return false, err
+	}
+	if inProgress {
+		log.V(1).Info("drain migration in progress", "src", move.Src.Address)
+		return true, nil
+	}
+
+	if !move.Src.KnowsNode(move.Dst.Id) {
+		log.V(1).Info("drain destination not yet known to source", "src", move.Src.Address, "dst", move.Dst.Address)
+		return true, nil
+	}
+
+	log.V(1).Info("draining slots", "src", move.Src.Address, "dst", move.Dst.Address, "slots", len(move.Slots))
+	r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "SlotsDraining", "ScaleIn", "Moving %d slots from %s to %s", len(move.Slots), move.Src.Address, move.Dst.Address)
+
+	ranges := valkey.SlotsToRanges(move.Slots)
+	if err := valkey.MigrateSlotsAtomic(ctx, move.Src, move.Dst, ranges); err != nil {
+		if valkey.IsSlotsNotServedByNode(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	slotMigrationBatchesTotal.WithLabelValues(cluster.Name, cluster.Namespace).Inc()
 	return true, nil
 }
 
 // deleteExcessValkeyNodes removes ValkeyNode CRs that are outside the desired
-// spec: shard-index >= spec.Shards OR node-index >= 1 + spec.Replicas.
-func (r *ValkeyClusterReconciler) deleteExcessValkeyNodes(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster) (bool, error) {
+// spec: shard-index >= spec.Shards OR node-index >= 1 + spec.Replicas. An
+// excess shard's node that may still own slots is kept, and its name returned.
+func (r *ValkeyClusterReconciler) deleteExcessValkeyNodes(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster, state *valkey.ClusterState, nodes *valkeyiov1alpha1.ValkeyNodeList) (deleted bool, kept []string, err error) {
 	log := logf.FromContext(ctx)
-	allNodes := &valkeyiov1alpha1.ValkeyNodeList{}
-	if err := r.List(ctx, allNodes, client.InNamespace(cluster.Namespace), client.MatchingLabels(map[string]string{LabelCluster: cluster.Name})); err != nil {
-		return false, err
-	}
+	owners := slotOwningPrimaryAddresses(state)
+	// Slots no scraped primary owns may belong to a node we could not reach.
+	unaccounted := len(state.GetUnassignedSlots()) > 0
 	nodesPerShard := 1 + int(cluster.Spec.Replicas)
-	deleted := false
-	for i := range allNodes.Items {
-		node := &allNodes.Items[i]
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
 		shardIndex, err := strconv.Atoi(node.Labels[LabelShardIndex])
 		if err != nil {
 			continue
@@ -1873,19 +1919,57 @@ func (r *ValkeyClusterReconciler) deleteExcessValkeyNodes(ctx context.Context, c
 		if err != nil {
 			continue
 		}
-		if shardIndex >= int(cluster.Spec.Shards) || nodeIndex >= nodesPerShard {
-			if err := r.Delete(ctx, node); err != nil {
-				if !apierrors.IsNotFound(err) {
-					return false, fmt.Errorf("delete excess ValkeyNode %s: %w", node.Name, err)
-				}
-			} else {
-				log.V(1).Info("deleted excess ValkeyNode", "name", node.Name, "shard", shardIndex, "node", nodeIndex)
-				r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "ValkeyNodeDeleted", "ScaleIn", "Deleted excess ValkeyNode %s (shard %d, node %d)", node.Name, shardIndex, nodeIndex)
-				deleted = true
+		excessShard := shardIndex >= int(cluster.Spec.Shards)
+		if !excessShard && nodeIndex < nodesPerShard {
+			continue
+		}
+		// Deleting a primary that still owns slots loses their keys. Only
+		// excess shards get drained, so only their nodes are guarded.
+		if excessShard {
+			if owners[node.Status.PodIP] {
+				r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "ScaleInBlocked", "ScaleIn", "Excess ValkeyNode %s still owns slots; waiting for drain", node.Name)
+				kept = append(kept, node.Name)
+				continue
+			}
+			if unaccounted && mayOwnSlots(node) && !state.HasAddress(node.Status.PodIP) {
+				r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "ScaleInBlocked", "ScaleIn", "Keeping unreachable excess ValkeyNode %s: some slots are unassigned", node.Name)
+				kept = append(kept, node.Name)
+				continue
 			}
 		}
+		if err := r.Delete(ctx, node); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return false, nil, fmt.Errorf("delete excess ValkeyNode %s: %w", node.Name, err)
+			}
+		} else {
+			log.V(1).Info("deleted excess ValkeyNode", "name", node.Name, "shard", shardIndex, "node", nodeIndex)
+			r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "ValkeyNodeDeleted", "ScaleIn", "Deleted excess ValkeyNode %s (shard %d, node %d)", node.Name, shardIndex, nodeIndex)
+			deleted = true
+		}
 	}
-	return deleted, nil
+	return deleted, kept, nil
+}
+
+// mayOwnSlots reports whether a node the scrape did not reach could be a
+// primary: it has a pod IP and was not last seen as a replica. An unready pod
+// has no role recorded, and after a failover a primary can be at any node
+// index.
+func mayOwnSlots(node *valkeyiov1alpha1.ValkeyNode) bool {
+	return node.Status.PodIP != "" && node.Status.Role != RoleReplica
+}
+
+// slotOwningPrimaryAddresses returns the pod IPs of primaries that own slots.
+func slotOwningPrimaryAddresses(state *valkey.ClusterState) map[string]bool {
+	owners := map[string]bool{}
+	for _, shard := range state.Shards {
+		if len(shard.Slots) == 0 {
+			continue
+		}
+		if p := shard.GetPrimaryNode(); p != nil {
+			owners[p.Address] = true
+		}
+	}
+	return owners
 }
 
 // shardIndexFromState determines the shard index for a given Valkey Cluster
@@ -1909,6 +1993,9 @@ func shardIndexFromState(shard *valkey.ShardState, nodes *valkeyiov1alpha1.Valke
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *ValkeyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.ValkeyClients == nil {
+		return errors.New("ValkeyCluster reconciler has no ClientProvider")
+	}
 	r.APIReader = mgr.GetAPIReader()
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&valkeyiov1alpha1.ValkeyCluster{}).
